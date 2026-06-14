@@ -1,0 +1,7 @@
+Flask==3.0.3
+waitress==3.0.0
+python-telegram-bot==22.8
+yfinance==0.2.54
+matplotlib==3.9.2
+pandas==2.2.3
+requests==2.32.3
