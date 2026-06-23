@@ -1,26 +1,26 @@
 # RateLy
 
-A multilingual Telegram bot for live prices, charts, anonymous support, ads, feedback, admin tools, and scheduled broadcasts.
+Multilingual Telegram bot for live prices, charts, conversion, watchlists, alerts, top movers, anonymous support, and admin tools.
 
-## Main UI
-- Buttons for prices, charts, language, base currency, support, ads, feedback, assets, referral, help
-- Anonymous ticket flow for support / ads / feedback
-- Auto-return to the main menu after selections
+## Files
+- main.py
+- requirements.txt
+- render.yaml
+- README.md
 
-## Environment variables
+## Recommended Render env vars
 - BOT_TOKEN
 - BOT_USERNAME
 - BOT_NAME
 - ADMIN_IDS
-- DEFAULT_LANG
+- DEFAULT_LANG=en
 - ADS_TEXT
 - ADS_EVERY
 - APP_TITLE
 - PYTHON_VERSION=3.11.9
 
-## Render
-Build Command: `pip install -r requirements.txt`
-Start Command: `python main.py`
-
-## BotFather
-Turn off Privacy Mode if you want the bot to read normal group messages.
+## Notes
+- The bot uses Nobitex public market stats for Iranian crypto pricing when possible.
+- It uses CoinGecko bulk market data for movers and crypto lookup.
+- It uses open.er-api for fiat FX conversion.
+- Set BotFather privacy mode OFF to read normal group messages.
