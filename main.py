@@ -9,7 +9,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict,Any, List, Optional, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
