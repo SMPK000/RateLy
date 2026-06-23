@@ -9,13 +9,14 @@ import threading
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
-from typing import Dict,Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 import pandas as pd
+import math
 import requests
 import yfinance as yf
 from flask import Flask, jsonify
@@ -597,8 +598,8 @@ def ticket_prompt_text(lang: str, kind: str) -> str:
             "es": "Envía tu mensaje de soporte. Se guardará de forma anónima.",
         },
         "ads": {
-            "fa": "متن تبلیغت را بفرست تا ناشناس برای ادمین ذخیره شود.",
-            "en": "Send your ad message. It will be stored anonymously.",
+            "fa": "متن تبلیغ و شرایط پیشنهادی‌ات را بفرست تا ناشناس برای بررسی ادمین ذخیره شود.",
+            "en": "Send your ad proposal and terms. It will be stored anonymously for review.",
             "ar": "أرسل نص الإعلان وسيتم حفظه بشكل مجهول.",
             "ru": "Отправьте текст рекламы. Он сохранится анонимно.",
             "tr": "Reklam mesajını gönder. Anonim olarak kaydedilecek.",
@@ -626,8 +627,8 @@ def ticket_prompt_text(lang: str, kind: str) -> str:
             "es": "Envía tu mensaje de soporte. Se guardará de forma anónima.",
         },
         "ads": {
-            "fa": "متن تبلیغت را بفرست تا ناشناس برای ادمین ذخیره شود.",
-            "en": "Send your ad message. It will be stored anonymously.",
+            "fa": "متن تبلیغ و شرایط پیشنهادی‌ات را بفرست تا ناشناس برای بررسی ادمین ذخیره شود.",
+            "en": "Send your ad proposal and terms. It will be stored anonymously for review.",
             "ar": "أرسل نص الإعلان وسيتم حفظه بشكل مجهول.",
             "ru": "Отправьте текст рекламы. Он сохранится анонимно.",
             "tr": "Reklam mesajını gönder. Anonim olarak kaydedilecek.",
@@ -1098,19 +1099,45 @@ def delete_alert(user_id: int, alert_id: int) -> None:
         conn.commit()
 
 
+
 def coin_gecko_search(query: str) -> Optional[dict]:
-    data = _safe_json("https://api.coingecko.com/api/v3/search", {"query": query.strip().lower()})
-    if not data:
+    q = normalize_text(query).strip().lower()
+    if not q:
         return None
-    coins = data.get("coins", []) or []
-    if not coins:
+    data = json_get("https://api.coingecko.com/api/v3/search", {"query": q})
+    if data:
+        coins = data.get("coins", []) or []
+        if coins:
+            exact = [c for c in coins if c.get("symbol", "").lower() == q or c.get("name", "").lower() == q]
+            if exact:
+                exact.sort(key=lambda x: (x.get("market_cap_rank") or 10**9))
+                return exact[0]
+            coins.sort(key=lambda x: (x.get("market_cap_rank") or 10**9))
+            return coins[0]
+    return None
+
+def coin_gecko_market_search(query: str) -> Optional[dict]:
+    q = normalize_text(query).strip().lower()
+    if not q:
         return None
-    exact = [c for c in coins if c.get("symbol", "").lower() == query.lower() or c.get("name", "").lower() == query.lower()]
+    data = json_get("https://api.coingecko.com/api/v3/coins/markets", {
+        "vs_currency": "usd",
+        "order": "market_cap_desc",
+        "per_page": "250",
+        "page": "1",
+        "sparkline": "false",
+    })
+    if not isinstance(data, list) or not data:
+        return None
+    exact = [c for c in data if c.get("symbol", "").lower() == q or c.get("name", "").lower() == q]
     if exact:
         exact.sort(key=lambda x: (x.get("market_cap_rank") or 10**9))
         return exact[0]
-    coins.sort(key=lambda x: (x.get("market_cap_rank") or 10**9))
-    return coins[0]
+    loose = [c for c in data if q in (c.get("symbol", "").lower() + " " + c.get("name", "").lower())]
+    if loose:
+        loose.sort(key=lambda x: (x.get("market_cap_rank") or 10**9))
+        return loose[0]
+    return None
 
 def get_crypto_price_usd(symbol: str) -> Optional[float]:
     s = symbol.upper()
@@ -1119,28 +1146,42 @@ def get_crypto_price_usd(symbol: str) -> Optional[float]:
     if cached is not None:
         return cached
 
+    # 1) Local Iranian exchange pair first (when available)
     local_irt = local_crypto_irt(s)
     usdt_irt = get_local_irt_per_usdt()
-    if local_irt:
+    if local_irt is not None:
+        if s in {"USDT", "USDTIRT", "USDT_IRT", "USDT_RLS"}:
+            if local_irt > 0:
+                cached_set(key, local_irt)
+                return local_irt
         if usdt_irt and usdt_irt > 0:
             val = local_irt / usdt_irt
-            cached_set(key, val)
-            return val
-        if s.endswith("USDT") or s == "USDT":
-            cached_set(key, local_irt)
-            return local_irt
+            if val > 0:
+                cached_set(key, val)
+                return val
 
+    # 2) CoinGecko search/simple price
     cg = coin_gecko_price_usd(s)
-    if cg:
+    if cg and cg > 0:
         cached_set(key, cg)
         return cg
 
+    # 3) CoinGecko markets fallback
+    market = coin_gecko_market_search(s)
+    if market:
+        p = _first_float(market.get("current_price"))
+        if p:
+            cached_set(key, p)
+            return p
+
+    # 4) yfinance fallback
     for t in [f"{s}-USD", f"{s}USD=X", f"{s}USDT=X"]:
         val = yfinance_last_close(t)
         if val:
             cached_set(key, val)
             return val
     return None
+
 
 def get_fiat_rate_to_usd(code: str) -> Optional[float]:
     code = code.upper()
@@ -1150,7 +1191,8 @@ def get_fiat_rate_to_usd(code: str) -> Optional[float]:
     cached = cached_get(key)
     if cached is not None:
         return cached
-    data = _safe_json("https://open.er-api.com/v6/latest/USD")
+
+    data = json_get("https://open.er-api.com/v6/latest/USD")
     if data and data.get("result") == "success":
         rates = data.get("rates", {})
         if code in rates and rates[code]:
@@ -1159,6 +1201,8 @@ def get_fiat_rate_to_usd(code: str) -> Optional[float]:
                 out = 1 / val
                 cached_set(key, out)
                 return out
+
+    # yfinance fallback for rarer pairs
     for t in [f"{code}USD=X", f"USD{code}=X"]:
         val = yfinance_last_close(t)
         if val:
@@ -1172,6 +1216,7 @@ def get_fiat_rate_to_usd(code: str) -> Optional[float]:
     return None
 
 def get_base_rate_to_usd(code: str) -> Optional[float]:
+
     code = code.upper()
     if code == "USD":
         return 1.0
@@ -1229,54 +1274,82 @@ def fiat_pair_rate(base: str, quote: str) -> Optional[float]:
         return br / qr
     return None
 
+
 def resolve_asset(query: str) -> Tuple[Optional[str], Optional[float], Optional[str], Optional[str], Optional[str]]:
     q = resolve_phrase(query)
     if not q:
         return None, None, None, None, None
-    q = q.upper().replace(" ", "").replace("-", "/")
+    raw = q.upper().replace(" ", "").replace("-", "/")
 
-    if q in METALS:
-        ticker, kind = METALS[q]
+    def usd_value_for(code: str) -> Optional[float]:
+        c = code.upper()
+        if c in METALS:
+            return yfinance_last_close(METALS[c][0])
+        if c in CRYPTO_ALIASES:
+            return get_crypto_price_usd(c)
+        if c in {"USD", "TMN", "IRR"} or re.fullmatch(r"[A-Z]{3}", c):
+            rate = get_base_rate_to_usd(c)
+            if rate is not None:
+                return rate
+        # generic crypto/name fallback
+        cg = get_crypto_price_usd(c)
+        if cg is not None:
+            return cg
+        # yfinance fallback for index/commodity style symbols
+        for t in [c, f"{c}=X", f"{c}-USD"]:
+            px = yfinance_last_close(t)
+            if px:
+                return px
+        return None
+
+    if raw in METALS:
+        ticker, _kind = METALS[raw]
         px = yfinance_last_close(ticker)
-        return ticker, px, "metal", q, "USD"
+        return ticker, px, "metal", raw, "USD"
 
-    if q in CRYPTO_ALIASES:
-        return q, get_crypto_price_usd(q), "crypto", q, "USD"
-
-    base, quote = parse_pair(q)
+    base, quote = parse_pair(raw)
     if quote:
-        if base in FIAT_CODES and quote in FIAT_CODES:
-            return f"{base}{quote}=X", fiat_pair_rate(base, quote), "pair", base, quote
-        if base in CRYPTO_ALIASES:
-            return base, get_crypto_price_usd(base), "crypto", base, quote
-        t = f"{base}{quote}=X"
-        px = yfinance_last_close(t)
-        if px:
-            return t, px, "pair", base, quote
-        inv = f"{quote}{base}=X"
-        inv_px = yfinance_last_close(inv)
-        if inv_px and inv_px != 0:
-            return inv, 1 / inv_px, "pair", base, quote
+        base_usd = usd_value_for(base)
+        quote_usd = usd_value_for(quote)
+        if base_usd is not None and quote_usd is not None and quote_usd != 0:
+            # pair value in quote units
+            return f"{base}/{quote}", base_usd / quote_usd, "pair", base, quote
+
+        # if only base is known, keep it as the asset and show USD/local conversion
+        if base_usd is not None:
+            if base in METALS:
+                ticker, _kind = METALS[base]
+                return ticker, base_usd, "metal", base, quote
+            if base in CRYPTO_ALIASES:
+                return base, base_usd, "crypto", base, quote
+            if base in {"USD", "TMN", "IRR"} or re.fullmatch(r"[A-Z]{3}", base):
+                return base, base_usd, "fiat", base, quote
+            return base, base_usd, "other", base, quote
         return None, None, None, None, None
 
-    if q in FIAT_CODES:
-        if q == "USD":
-            return "USD", 1.0, "fiat", "USD", "USD"
-        return q, get_fiat_rate_to_usd(q), "fiat", q, "USD"
+    # single asset
+    if raw in {"USD", "TMN", "IRR"} or re.fullmatch(r"[A-Z]{3}", raw):
+        rate = get_base_rate_to_usd(raw)
+        if rate is not None:
+            return raw, rate, "fiat", raw, "USD"
 
-    if q in CRYPTO_ALIASES:
-        return q, get_crypto_price_usd(q), "crypto", q, "USD"
+    if raw in CRYPTO_ALIASES:
+        px = get_crypto_price_usd(raw)
+        return raw, px, "crypto", raw, "USD"
 
-    px = get_crypto_price_usd(q)
-    if px:
-        return q, px, "crypto", q, "USD"
-    for t in [q, f"{q}=X", f"{q}-USD"]:
-        px = yfinance_last_close(t)
-        if px:
-            return t, px, "other", q, "USD"
+    # name / symbol fallbacks
+    px = usd_value_for(raw)
+    if px is not None:
+        if raw in METALS:
+            return METALS[raw][0], px, "metal", raw, "USD"
+        if raw in CRYPTO_ALIASES:
+            return raw, px, "crypto", raw, "USD"
+        return raw, px, "other", raw, "USD"
+
     return None, None, None, None, None
 
 def format_money(value: float, code: str) -> str:
+
     if code == "TMN":
         return f"{value:,.0f} تومان"
     if code == "IRR":
@@ -1912,16 +1985,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await q.answer()
     data = q.data or ""
 
+    
     async def _show_home():
         text = home_text(uid)
         try:
-            if q.message and q.message.photo:
-                await q.edit_message_caption(caption=text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_keyboard(uid))
-            else:
-                await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_keyboard(uid))
+            await q.message.reply_text(
+                text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=main_keyboard(uid),
+            )
         except Exception:
             try:
-                await q.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_keyboard(uid))
+                await q.message.reply_text(
+                    text,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=main_keyboard(uid),
+                )
             except Exception:
                 pass
 
@@ -2617,100 +2696,82 @@ def fiat_pair_rate(base: str, quote: str) -> Optional[float]:
         return qu / bu
     return None
 
+
 def resolve_asset(query: str) -> Tuple[Optional[str], Optional[float], Optional[str], Optional[str], Optional[str]]:
     q = resolve_phrase(query)
     if not q:
         return None, None, None, None, None
     raw = q.upper().replace(" ", "").replace("-", "/")
 
-    # Direct fiat / crypto / metal symbols
-    if raw in {"XAU", "GOLD"}:
-        # prefer spot; fallback to futures
-        for t in ["XAUUSD=X", "GC=F", "GLD"]:
+    def usd_value_for(code: str) -> Optional[float]:
+        c = code.upper()
+        if c in METALS:
+            return yfinance_last_close(METALS[c][0])
+        if c in CRYPTO_ALIASES:
+            return get_crypto_price_usd(c)
+        if c in {"USD", "TMN", "IRR"} or re.fullmatch(r"[A-Z]{3}", c):
+            rate = get_base_rate_to_usd(c)
+            if rate is not None:
+                return rate
+        # generic crypto/name fallback
+        cg = get_crypto_price_usd(c)
+        if cg is not None:
+            return cg
+        # yfinance fallback for index/commodity style symbols
+        for t in [c, f"{c}=X", f"{c}-USD"]:
             px = yfinance_last_close(t)
             if px:
-                return t, px, "metal", "XAU", "USD"
-        return "XAUUSD=X", None, "metal", "XAU", "USD"
-    if raw in {"XAG", "SILVER"}:
-        for t in ["XAGUSD=X", "SI=F"]:
-            px = yfinance_last_close(t)
-            if px:
-                return t, px, "metal", "XAG", "USD"
-        return "XAGUSD=X", None, "metal", "XAG", "USD"
-    if raw in {"XPT", "PLATINUM"}:
-        for t in ["XPTUSD=X", "PL=F"]:
-            px = yfinance_last_close(t)
-            if px:
-                return t, px, "metal", "XPT", "USD"
-        return "XPTUSD=X", None, "metal", "XPT", "USD"
-    if raw in {"XPD", "PALLADIUM"}:
-        for t in ["XPDUSD=X", "PA=F"]:
-            px = yfinance_last_close(t)
-            if px:
-                return t, px, "metal", "XPD", "USD"
-        return "XPDUSD=X", None, "metal", "XPD", "USD"
-    if raw in {"OIL", "WTI"}:
-        for t in ["CL=F", "BZ=F"]:
-            px = yfinance_last_close(t)
-            if px:
-                return t, px, "commodity", "OIL", "USD"
-        return "CL=F", None, "commodity", "OIL", "USD"
+                return px
+        return None
+
+    if raw in METALS:
+        ticker, _kind = METALS[raw]
+        px = yfinance_last_close(ticker)
+        return ticker, px, "metal", raw, "USD"
 
     base, quote = parse_pair(raw)
     if quote:
-        if base in FIAT_CODES and quote in FIAT_CODES:
-            return f"{base}{quote}=X", fiat_pair_rate(base, quote), "pair", base, quote
-        if base in CRYPTO_ALIASES or coin_gecko_search(base.lower()):
-            px = get_crypto_price_usd(base)
-            if px is not None:
-                return base, px, "crypto", base, quote
-        t = f"{base}{quote}=X"
-        px = yfinance_last_close(t)
-        if px:
-            return t, px, "pair", base, quote
-        inv = f"{quote}{base}=X"
-        inv_px = yfinance_last_close(inv)
-        if inv_px and inv_px != 0:
-            return inv, 1 / inv_px, "pair", base, quote
-        # if a crypto pair is entered in reverse, still try to identify base
-        if base in CRYPTO_ALIASES or coin_gecko_search(base.lower()):
-            px = get_crypto_price_usd(base)
-            if px is not None:
-                return base, px, "crypto", base, quote
+        base_usd = usd_value_for(base)
+        quote_usd = usd_value_for(quote)
+        if base_usd is not None and quote_usd is not None and quote_usd != 0:
+            # pair value in quote units
+            return f"{base}/{quote}", base_usd / quote_usd, "pair", base, quote
+
+        # if only base is known, keep it as the asset and show USD/local conversion
+        if base_usd is not None:
+            if base in METALS:
+                ticker, _kind = METALS[base]
+                return ticker, base_usd, "metal", base, quote
+            if base in CRYPTO_ALIASES:
+                return base, base_usd, "crypto", base, quote
+            if base in {"USD", "TMN", "IRR"} or re.fullmatch(r"[A-Z]{3}", base):
+                return base, base_usd, "fiat", base, quote
+            return base, base_usd, "other", base, quote
         return None, None, None, None, None
 
-    if raw in FIAT_CODES:
-        if raw == "USD":
-            return "USD", 1.0, "fiat", "USD", "USD"
-        usd_per_unit = fiat_usd_per_unit(raw)
-        return raw, usd_per_unit, "fiat", raw, "USD"
+    # single asset
+    if raw in {"USD", "TMN", "IRR"} or re.fullmatch(r"[A-Z]{3}", raw):
+        rate = get_base_rate_to_usd(raw)
+        if rate is not None:
+            return raw, rate, "fiat", raw, "USD"
+
     if raw in CRYPTO_ALIASES:
-        return raw, get_crypto_price_usd(raw), "crypto", raw, "USD"
+        px = get_crypto_price_usd(raw)
+        return raw, px, "crypto", raw, "USD"
 
-    # broad CoinGecko fallback for names/symbols
-    if len(raw) >= 2 and len(raw) <= 24:
-        cg = coin_gecko_search(raw.lower())
-        if cg and cg.get("id"):
-            data = _safe_json("https://api.coingecko.com/api/v3/simple/price", {"ids": cg["id"], "vs_currencies": "usd"})
-            if data and cg["id"] in data and "usd" in data[cg["id"]]:
-                px = float(data[cg["id"]]["usd"])
-                return cg["symbol"].upper(), px, "crypto", cg["symbol"].upper(), "USD"
-
-    # yfinance fallback
-    for t in [raw, f"{raw}=X", f"{raw}-USD", f"{raw}-USDT"]:
-        px = yfinance_last_close(t)
-        if px:
-            return t, px, "other", raw, "USD"
+    # name / symbol fallbacks
+    px = usd_value_for(raw)
+    if px is not None:
+        if raw in METALS:
+            return METALS[raw][0], px, "metal", raw, "USD"
+        if raw in CRYPTO_ALIASES:
+            return raw, px, "crypto", raw, "USD"
+        return raw, px, "other", raw, "USD"
 
     return None, None, None, None, None
 
-def display_to_base(usd_value: float, base: str) -> Optional[float]:
-    rate = get_base_rate_to_usd(base)
-    if rate is None:
-        return None
-    return usd_value * rate
-
 def format_money(value: float, code: str) -> str:
+
     if code == "TMN":
         return f"{value:,.0f} تومان ایران"
     if code == "IRR":
